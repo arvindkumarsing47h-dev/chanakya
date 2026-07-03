@@ -1,0 +1,7 @@
+{
+  "name": "chanakya-nse-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Project Chanakya 2040 - NSE live data CORS proxy for Cloudflare Workers",
+  "main": "src/index.js"
+}
