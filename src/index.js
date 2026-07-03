@@ -1,34 +1,22 @@
 /**
- * Project Chanakya 2040 — NSE Live Data Proxy (Cloudflare Worker)
+ * Project Chanakya 2040 — Live Data Proxy (Cloudflare Worker)
  * ------------------------------------------------------------
- * यह Worker NSE India की website से live quote data लाकर आपके
- * HTML app को CORS-free तरीके से देता है।
+ * v2: Yahoo Finance ka istemaal karta hai (NSE India ne Cloudflare
+ * Workers ke IP addresses ko block kar diya tha — 403 error — isliye
+ * ab yeh zyada reliable source use kar rahe hain).
  *
- * DEPLOY कैसे करें (एक बार, 5 मिनट):
- * 1. https://dash.cloudflare.com पर free account बनाएं (अगर नहीं है)
- * 2. बाईं तरफ "Workers & Pages" > "Create" > "Create Worker"
- * 3. एक नाम दें जैसे: chanakya-nse-proxy
- * 4. "Edit Code" खोलें, यहाँ की पूरी फाइल का content copy-paste करें
- *    (मौजूदा default code को पूरा हटाकर)
- * 5. "Deploy" दबाएं
- * 6. आपको एक URL मिलेगा जैसे:
- *    https://chanakya-nse-proxy.<your-subdomain>.workers.dev
- * 7. यही URL Chanakya App की "Settings" में डालना है (एक बार)
+ * USE:
+ *   GET <your-worker-url>/?symbol=TCS
+ *   GET <your-worker-url>/?symbol=RELIANCE
+ *   GET <your-worker-url>/?symbol=INFY
  *
- * USE कैसे करें:
- *   GET  <your-worker-url>/?symbol=RELIANCE
- *   GET  <your-worker-url>/?symbol=TCS
- * (Symbol वही डालें जो NSE पर होता है, जैसे: TCS, INFY, BSPHCL listed नहीं है
- *  तो केवल NSE/BSE-listed companies के लिए काम करेगा)
+ * Symbol wahi likhein jo NSE par listed hai, bina .NS ke — worker
+ * khud .NS jod deta hai.
  *
- * ⚠️ ईमानदार चेतावनी:
- * - NSE अपनी website की सुरक्षा (anti-bot) समय-समय पर बदलता रहता है,
- *   इसलिए यह Worker कभी-कभी अस्थायी रूप से काम करना बंद कर सकता है।
- *   ऐसा होने पर कुछ घंटे बाद दोबारा कोशिश करें।
- * - यह unofficial तरीका है (NSE की कोई paid/official API यहाँ इस्तेमाल
- *   नहीं हो रही) — भारी/commercial इस्तेमाल के लिए Kite Connect या
- *   किसी licensed data vendor का इस्तेमाल करें।
- * - डेटा में कभी-कभी देरी (15-min delay या उससे ज़्यादा) हो सकती है।
+ * NOTE: P/E ratio Yahoo ke is free endpoint mein reliably nahi
+ * milta, isliye woh field abhi bhi manually bharni hogi (Valuation
+ * tab mein). CMP, din ka high/low, aur 52-week high/low automatic
+ * aa jayenge.
  */
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -41,18 +29,6 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "*",
     "Cache-Control": "no-store"
   };
-}
-
-async function getNseCookies() {
-  const res = await fetch("https://www.nseindia.com/get-quotes/equity", {
-    headers: {
-      "User-Agent": UA,
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9"
-    }
-  });
-  const setCookie = res.headers.get("set-cookie") || "";
-  return setCookie;
 }
 
 export default {
@@ -69,52 +45,49 @@ export default {
         { status: 400, headers: corsHeaders() });
     }
 
-    try {
-      const cookies = await getNseCookies();
+    const yahooSymbol = symbol + ".NS";
 
+    try {
       const apiRes = await fetch(
-        "https://www.nseindia.com/api/quote-equity?symbol=" + encodeURIComponent(symbol),
+        "https://query1.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(yahooSymbol),
         {
           headers: {
             "User-Agent": UA,
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=" + encodeURIComponent(symbol),
-            "Cookie": cookies
+            "Accept": "application/json"
           }
         }
       );
 
       if (!apiRes.ok) {
         return new Response(JSON.stringify({
-          error: "NSE responded with status " + apiRes.status + ". NSE may be rate-limiting or blocking — try again in a few minutes.",
+          error: "Data source responded with status " + apiRes.status + ". Symbol galat ho sakta hai, ya kuch der baad try karein.",
           symbol: symbol
         }), { status: 502, headers: corsHeaders() });
       }
 
       const raw = await apiRes.json();
 
-      // Extract only the fields Chanakya app needs, with safe fallbacks
-      const priceInfo = raw && raw.priceInfo ? raw.priceInfo : {};
-      const metadata = raw && raw.metadata ? raw.metadata : {};
-      const info = raw && raw.info ? raw.info : {};
-      const weekHL = priceInfo.weekHighLow || {};
+      const result = (raw && raw.chart && raw.chart.result && raw.chart.result[0]) ? raw.chart.result[0] : null;
+      if (!result || !result.meta) {
+        const err = (raw && raw.chart && raw.chart.error && raw.chart.error.description) ? raw.chart.error.description : "Symbol not found";
+        return new Response(JSON.stringify({ error: err, symbol: symbol }), { status: 404, headers: corsHeaders() });
+      }
 
+      const meta = result.meta;
       const clean = {
         symbol: symbol,
-        companyName: info.companyName || null,
-        cmp: (priceInfo.lastPrice !== undefined) ? priceInfo.lastPrice : null,
-        change: (priceInfo.change !== undefined) ? priceInfo.change : null,
-        pChange: (priceInfo.pChange !== undefined) ? priceInfo.pChange : null,
-        dayHigh: (priceInfo.intraDayHighLow && priceInfo.intraDayHighLow.max !== undefined) ? priceInfo.intraDayHighLow.max : null,
-        dayLow: (priceInfo.intraDayHighLow && priceInfo.intraDayHighLow.min !== undefined) ? priceInfo.intraDayHighLow.min : null,
-        week52High: (weekHL.max !== undefined) ? weekHL.max : null,
-        week52Low: (weekHL.min !== undefined) ? weekHL.min : null,
-        sectorPE: (metadata.pdSectorPe !== undefined) ? metadata.pdSectorPe : null,
-        symbolPE: (metadata.pdSymbolPe !== undefined) ? metadata.pdSymbolPe : null,
-        industry: metadata.industry || null,
-        lastUpdateTime: metadata.lastUpdateTime || null,
-        fetchedAt: new Date().toISOString()
+        companyName: meta.longName || meta.shortName || null,
+        cmp: (meta.regularMarketPrice !== undefined) ? meta.regularMarketPrice : null,
+        previousClose: (meta.previousClose !== undefined) ? meta.previousClose :
+                       (meta.chartPreviousClose !== undefined ? meta.chartPreviousClose : null),
+        dayHigh: (meta.regularMarketDayHigh !== undefined) ? meta.regularMarketDayHigh : null,
+        dayLow: (meta.regularMarketDayLow !== undefined) ? meta.regularMarketDayLow : null,
+        week52High: (meta.fiftyTwoWeekHigh !== undefined) ? meta.fiftyTwoWeekHigh : null,
+        week52Low: (meta.fiftyTwoWeekLow !== undefined) ? meta.fiftyTwoWeekLow : null,
+        currency: meta.currency || "INR",
+        exchangeTimezone: meta.exchangeTimezoneName || null,
+        fetchedAt: new Date().toISOString(),
+        note: "P/E is not available from this source — please enter manually in the Valuation tab."
       };
 
       return new Response(JSON.stringify(clean), { headers: corsHeaders() });
